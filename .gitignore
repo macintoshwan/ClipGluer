@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.wav
+*.mkv
+*.mp4
+*.avi
+*.mov
+*.tmp
+.DS_Store
+.env
+.vscode/
+*.log
