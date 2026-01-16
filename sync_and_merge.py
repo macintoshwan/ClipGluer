@@ -82,7 +82,8 @@ def gcc_phat_lag(ref: np.ndarray, sync: np.ndarray) -> int:
 
 def compute_offset_seconds(
     ref_wav: Path, sync_wav: Path, method: str = "xcorr", use_bandpass: bool = False,
-    max_seconds: int = 300, plot_waveform: bool = False
+    max_seconds: int = 300, plot_waveform: bool = False,
+    target_sr: int = 2000, max_offset_s: int = 30, compare_sec: int = 60
 ) -> float:
     """Return offset where positive means sync_wav starts later than ref_wav."""
     ref_audio, sr_ref = sf.read(ref_wav, dtype="float32")
@@ -98,7 +99,7 @@ def compute_offset_seconds(
     # 新算法：滑窗点积互相关
     offset = sliding_cross_correlation_offset(
         ref_audio, sync_audio, sr_ref,
-        target_sr=2000, max_offset_s=30, compare_sec=60, plot=plot_waveform
+        target_sr=target_sr, max_offset_s=max_offset_s, compare_sec=compare_sec, plot=plot_waveform
     )
     print(f"[sliding xcorr] Estimated offset (sync - ref): {offset:.3f} seconds")
     return offset
@@ -106,7 +107,7 @@ def compute_offset_seconds(
 
 def build_ffmpeg_command(
     ref_video: Path, sync_video: Path, offset_sec: float, output: Path, ffmpeg_bin: str = "ffmpeg",
-    gpu: str = "none", height: int = 720
+    gpu: str = "none", height: int = 720, cq: int = 18, denoise: bool = True
 ) -> list[str]:
     """Return ffmpeg CLI for horizontal stack with both audios preserved."""
     if offset_sec >= 0:
@@ -128,30 +129,45 @@ def build_ffmpeg_command(
     # 不要加 -hwaccel
     cmd += ["-i", str(sync_video)]
 
-    filter_complex = (
-        f"[0:v]scale=-1:{height},setpts=PTS-STARTPTS[v0];"
-        f"[1:v]scale=-1:{height},setpts=PTS-STARTPTS[v1];"
-        f"[v0][v1]hstack=shortest=1[v];"
-        f"[0:a]afftdn[a0];"
-        f"[1:a]anlmdn[a1]"
-    )
-    cmd += [
-        "-filter_complex", filter_complex,
-        "-map", "[v]", "-map", "[a0]", "-map", "[a1]",
-        "-metadata:s:a:0", "title=Audio-0 (ref,denoised)",
-        "-metadata:s:a:1", "title=Audio-1 (sync,denoised)",
-        "-disposition:a:0", "default"
-    ]
+    # Build filter_complex with optional denoise
+    if denoise:
+        filter_complex = (
+            f"[0:v]scale=-1:{height},setpts=PTS-STARTPTS[v0];"
+            f"[1:v]scale=-1:{height},setpts=PTS-STARTPTS[v1];"
+            f"[v0][v1]hstack=shortest=1[v];"
+            f"[0:a]afftdn[a0];"
+            f"[1:a]anlmdn[a1]"
+        )
+        cmd += [
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "[a0]", "-map", "[a1]",
+            "-metadata:s:a:0", "title=Audio-0 (ref,denoised)",
+            "-metadata:s:a:1", "title=Audio-1 (sync,denoised)",
+            "-disposition:a:0", "default"
+        ]
+    else:
+        filter_complex = (
+            f"[0:v]scale=-1:{height},setpts=PTS-STARTPTS[v0];"
+            f"[1:v]scale=-1:{height},setpts=PTS-STARTPTS[v1];"
+            f"[v0][v1]hstack=shortest=1[v]"
+        )
+        cmd += [
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "0:a:0", "-map", "1:a:0",
+            "-metadata:s:a:0", "title=Audio-0 (ref)",
+            "-metadata:s:a:1", "title=Audio-1 (sync)",
+            "-disposition:a:0", "default"
+        ]
 
     # Video encoder selection
     if gpu == "nvidia":
-        cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"]
+        cmd += ["-c:v", "h264_nvenc", "-preset", "p7", "-rc", "vbr", "-cq", str(cq), "-b:v", "0"]
     elif gpu == "intel":
-        cmd += ["-c:v", "h264_qsv", "-global_quality", "23"]
+        cmd += ["-c:v", "h264_qsv", "-global_quality", str(cq)]
     elif gpu == "amd":
-        cmd += ["-c:v", "h264_amf", "-quality", "quality", "-rc", "vbr", "-q", "23"]
+        cmd += ["-c:v", "h264_amf", "-quality", "quality", "-rc", "vbr", "-q", str(cq)]
     else:
-        cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "medium"]
+        cmd += ["-c:v", "libx264", "-crf", str(cq), "-preset", "slow"]
 
     cmd += ["-c:a", "aac", "-movflags", "+faststart", str(output)]
     return cmd
@@ -234,8 +250,13 @@ def main() -> None:
     parser.add_argument("--method", choices=["xcorr", "gcc-phat"], default="xcorr", help="Offset estimation method")
     parser.add_argument("--bandpass", action="store_true", help="Apply 100–4000 Hz band-pass before correlation")
     parser.add_argument("--gpu", choices=["none", "nvidia", "intel", "amd"], default="none", help="Use GPU encoding/decoding")
-    parser.add_argument("--height", type=int, default=720, help="Per-stream output height before hstack")
-    parser.add_argument("--plot", action="store_true", help="Plot first 120s waveform for both audios")  # <-- 加这一行
+    parser.add_argument("--height", type=int, default=-1, help="Per-stream output height before hstack (default: -1 = original)")
+    parser.add_argument("--cq", type=int, default=0, help="Video quality (0=best/lossless, 51=worst)")
+    parser.add_argument("--denoise", action="store_true", help="Enable audio denoising filters (afftdn/anlmdn)")
+    parser.add_argument("--target-sr", type=int, default=2000, help="Target sample rate for alignment (Hz)")
+    parser.add_argument("--max-offset", type=int, default=30, help="Max offset search range (seconds)")
+    parser.add_argument("--compare-seconds", type=int, default=60, help="Window length for alignment (seconds)")
+    parser.add_argument("--plot", action="store_true", help="Plot first 120s waveform for both audios")
     args = parser.parse_args()
 
     ffmpeg_bin = resolve_ffmpeg_bin(args.ffmpeg)
@@ -248,10 +269,14 @@ def main() -> None:
         run_ffmpeg_extract(args.ref_video, ref_wav, ffmpeg_bin=ffmpeg_bin)
         run_ffmpeg_extract(args.sync_video, sync_wav, ffmpeg_bin=ffmpeg_bin)
 
-        offset_sec = compute_offset_seconds(ref_wav, sync_wav, method=args.method, use_bandpass=args.bandpass, plot_waveform=True)
+        offset_sec = compute_offset_seconds(
+            ref_wav, sync_wav, method=args.method, use_bandpass=args.bandpass, plot_waveform=args.plot,
+            target_sr=args.target_sr, max_offset_s=args.max_offset, compare_sec=args.compare_seconds
+        )
         print(f"Estimated offset (sync - ref): {offset_sec:.3f} seconds")
         cmd = build_ffmpeg_command(
-            args.ref_video, args.sync_video, offset_sec, args.output, ffmpeg_bin=ffmpeg_bin, gpu=args.gpu, height=args.height
+            args.ref_video, args.sync_video, offset_sec, args.output, ffmpeg_bin=ffmpeg_bin,
+            gpu=args.gpu, height=args.height, cq=args.cq, denoise=args.denoise
         )
         print("\nSuggested ffmpeg command:")
         print(" ".join(cmd))

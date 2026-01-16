@@ -11,3 +11,4 @@ __pycache__/
 .env
 .vscode/
 *.log
+*.srt
